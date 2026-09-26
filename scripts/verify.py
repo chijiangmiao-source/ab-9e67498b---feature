@@ -3,7 +3,9 @@
 
 1. 构建检查：全部源码可编译（字节码语法检查）；
 2. 代码测试：unittest 全量用例（含永不放行违规闭环检测）；
-3. HTTP 冒烟：健康检查、成立结论、违规闭环证据、非法请求 400 且无审计、编号读取。
+3. HTTP 冒烟：健康检查、成立结论、违规闭环证据、非法请求 400 且无审计、编号读取；
+4. 最小切换抑制审计：两条替代违规环的全局最少修复、升序裁决、
+   审计按编号读取、原复核读取回归（不被改写）、三类失败定位。
 
 任一步失败即以非零退出码退出。
 """
@@ -79,6 +81,33 @@ COMPLIANT = {
     "formula": "G(!request | F granted)",
 }
 
+# 两条替代违规环：req->wait_a->req 与 req->wait_b->req 都永不放行。
+# 每环两条边均可破（a1/a2、b1/b2），共 4 个规模为 2 的可行修复，
+# 全局最少 = 2 条，按切换标识升序序列裁决为 [a1, b1]。
+TWO_LOOPS = {
+    "locations": ["idle", "req", "wait_a", "wait_b", "grant"],
+    "initial": "idle",
+    "switches": [
+        {"id": "t1", "source": "idle", "target": "req"},
+        {"id": "a1", "source": "req", "target": "wait_a"},
+        {"id": "a2", "source": "wait_a", "target": "req"},
+        {"id": "a3", "source": "wait_a", "target": "grant"},
+        {"id": "b1", "source": "req", "target": "wait_b"},
+        {"id": "b2", "source": "wait_b", "target": "req"},
+        {"id": "b3", "source": "wait_b", "target": "grant"},
+        {"id": "g1", "source": "req", "target": "grant"},
+        {"id": "g2", "source": "grant", "target": "idle"},
+    ],
+    "propositions": {
+        "idle": [],
+        "req": ["request"],
+        "wait_a": ["request"],
+        "wait_b": ["request"],
+        "grant": ["granted"],
+    },
+    "formula": "G(!request | F granted)",
+}
+
 
 def main():
     # 1. 构建检查
@@ -147,8 +176,9 @@ def main():
           f"loop_locs={loop_locs}")
     check("闭环上公式逐点为假（无限违规，非有限回放）", loop_false)
     check("每步含位置/切换/子式真值证据", evidence_ok)
+    starve_id = body.get("id")
     check("违规同样保存并可按编号读取",
-          body.get("id") and http("GET", f"/checks/{body['id']}")[0] == 200)
+          starve_id and http("GET", f"/checks/{starve_id}")[0] == 200)
 
     bad = json.loads(json.dumps(STARVATION))
     bad["switches"] = bad["switches"][:2]  # deny/grant 变死端
@@ -171,6 +201,71 @@ def main():
 
     status, body = http("GET", "/checks/CHK-000000")
     check("不存在编号 404", status == 404)
+
+    # 4. 最小切换抑制审计：两条替代违规环
+    section("最小切换抑制审计（两条替代违规环）")
+    status, body = http("POST", "/checks", TWO_LOOPS)
+    loops_id = body.get("id")
+    check("双违规环规程 POST 201 且 holds=false",
+          status == 201 and body.get("holds") is False and loops_id,
+          f"status={status}")
+
+    status, audit = http("POST", f"/checks/{loops_id}/suppression-audits")
+    sup_id = audit.get("id")
+    check("抑制审计 201 并分配 SUP 编号",
+          status == 201 and isinstance(sup_id, str)
+          and sup_id.startswith("SUP-"),
+          f"status={status} body={audit}")
+    check("全局最少禁用 2 条且升序裁决为 [a1, b1]",
+          audit.get("min_disabled_count") == 2
+          and audit.get("disabled_switches") == ["a1", "b1"],
+          f"disabled={audit.get('disabled_switches')}")
+    check("记录来源复核编号与原公式摘要",
+          audit.get("source_check_id") == loops_id
+          and audit.get("formula_summary", {}).get("text")
+          == TWO_LOOPS["formula"])
+    proof = audit.get("final_proof") or {}
+    check("修复后结论成立且含可复算最终证明",
+          audit.get("holds_after_repair") is True
+          and proof.get("holds") is True
+          and isinstance(proof.get("stats"), dict)
+          and "a1" not in proof.get("remaining_switches", [])
+          and "b1" not in proof.get("remaining_switches", []))
+
+    status, fetched = http("GET", f"/suppression-audits/{sup_id}")
+    check("按审计编号读取抑制审计（刷新后仍可读）",
+          status == 200 and fetched.get("id") == sup_id
+          and fetched.get("disabled_switches") == ["a1", "b1"]
+          and fetched.get("min_disabled_count") == 2,
+          f"status={status}")
+
+    # 原有读取回归：原复核与规程不被改写
+    status, orig = http("GET", f"/checks/{loops_id}")
+    check("原有读取回归：原复核结论与套索证据不被改写",
+          status == 200 and orig.get("holds") is False
+          and orig.get("violation")
+          and len(orig.get("switches", [])) == len(TWO_LOOPS["switches"]),
+          f"status={status}")
+
+    # 失败定位：均不创建审计
+    status, body = http("POST", f"/checks/{ok_id}/suppression-audits")
+    check("来源结论本就成立 409 且不创建审计",
+          status == 409 and body.get("error") == "source_holds"
+          and "id" not in body,
+          f"status={status} body={body}")
+
+    status, body = http("POST", "/checks/CHK-999999/suppression-audits")
+    check("来源编号不存在 404 且不创建审计",
+          status == 404 and "id" not in body, f"status={status}")
+
+    status, body = http("POST", f"/checks/{starve_id}/suppression-audits")
+    check("无可行修复（保全部位置可外出）422 且不创建审计",
+          status == 422 and body.get("error") == "no_feasible_suppression"
+          and "id" not in body,
+          f"status={status} body={body}")
+
+    status, body = http("GET", "/suppression-audits/SUP-999999")
+    check("不存在审计编号 404", status == 404)
 
     section("汇总")
     if FAILURES:
