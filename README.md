@@ -30,12 +30,13 @@ tableau 完全独立：直接枚举位置图上的简单前缀+闭环行走，�
 ```
 app/ltl_parser.py   LTL 词法/语法解析、AST、子式索引
 app/checker.py      NNF 规范化、按需 GBA、乘积、SCC、套索、子式真值证据
+app/suppression.py  最小切换抑制审计：分支定界求全局最少禁用切换
 app/validation.py   结构/公式校验（定位拒绝，非法不生成审计）
 app/storage.py      审计编号持久化（JSON，原子写，线程安全）
 app/server.py       零第三方依赖的 HTTP 服务（标准库）
 app/healthcheck.py  容器健康检查脚本
 scripts/verify.py   Compose verify：构建检查 + 单元测试 + HTTP 冒烟
-tests/              38 个 unittest 用例
+tests/              49 个 unittest 用例
 examples/           合规与违规（永不放行闭环）两个示例
 Dockerfile          python:3.11-slim，零 pip 依赖，带 HEALTHCHECK
 docker-compose.yml  ltl 服务 + verify 验收服务
@@ -64,15 +65,46 @@ docker-compose.yml  ltl 服务 + verify 验收服务
 |---|---|---|
 | `POST` | `/checks` | 提交复核；成功返回 201 并分配编号，非法输入返回 400 且**不**生成审计 |
 | `GET`  | `/checks/<id>` | 按编号读取：成立结论，或带每步位置/切换/子式真值的违规套索 |
+| `POST` | `/checks/<id>/suppressions` | 对已判**不成立**的复核发起最小切换抑制审计；成功 201 并分配审计编号 |
+| `GET`  | `/suppressions/<id>` | 按审计编号读取抑制审计（刷新/重启后仍可读） |
 | `GET`  | `/health` | 健康检查 |
 
-合规结果：`{"id","formula","initial","holds":true,"normalization":{
-"negation_nnf", "method"}, "stats":{...}}`
+合规结果：`{"id","formula","initial","spec","holds":true,"normalization":{
+"negation_nnf", "method"}, "stats":{...}}`；其中 `spec` 为保存的规程
+（位置/切换/命题/公式），供抑制审计重构乘积，保存后不被改写。
 
 违规结果额外含 `violation`：`prefix_length`、`cycle_length`、
 `loop_start_index`、`steps[]`（每步 `location`、`switch_taken`、
 `propositions`、`subformula_truth`、`formula_true_here`、
 `negation_automaton_formulas`）与说明 `note`。
+
+## 最小切换抑制审计
+
+安全工程师在已读取到**不成立**结论的复核上，可发起最小切换抑制审计：
+确认至少临时禁用哪些既有有向切换，才能使**同一初态**起的所有无限执行
+都满足原公式。原复核与规程不被改写。
+
+1. **重构**：从来源复核保存的规程与公式重新构造否定 GBA 乘积。
+2. **套索 → 冲突集**：每次发现的可达接受套索，其全部切换（前缀 + 闭环）
+   构成必须命中的切换集合 —— 任何可行禁用集都至少含其一，否则该套索在
+   禁用后的规程中仍然存活。
+3. **分支定界**：持续向候选禁用集加入套索内切换并重跑完整复核，求得
+   **全局最少**集合；候选集不得令任一位置失去全部外出切换；同样大小的
+   可行修复按切换标识升序序列取字典序最小（稳定裁决）。
+4. 不使用有限回放、随机搜索、逐条贪心禁用，也不只修补首次证据。
+
+成功审计（201，`SUP-000001` 起编号）保存：来源复核编号
+（`source_check_id`）、原公式摘要（`formula_summary`）、最少数量
+（`min_disabled_count`）、禁用切换（`disabled_switches`，升序）、
+修复后结论（`post_repair`）与可复算的最终证明（`proof`：禁用后规程
+`reduced_procedure` + 重跑复核的 `final_check`，重新提交即可复算同一
+成立结论）。审计落盘持久化，刷新或服务重启后按审计编号仍可读取。
+
+失败定位（均**不**创建审计）：
+
+- `404` 来源复核编号不存在；
+- `409 source_already_holds` 来源结论本就成立；
+- `422 no_feasible_suppression` 不存在保持全部位置可外出的修复。
 
 ## 运行
 
@@ -89,7 +121,12 @@ curl -s -X POST localhost:9090/checks -H 'Content-Type: application/json' \
 # 按编号读取
 curl -s localhost:9090/checks/CHK-000001
 
-# 验收（构建检查 + 38 单测 + HTTP 冒烟，围绕永不放行违规闭环），退出码报告
+# 对不成立的复核发起最小切换抑制审计，并按审计编号读取
+curl -s -X POST localhost:9090/checks/CHK-000002/suppressions
+curl -s localhost:9090/suppressions/SUP-000001
+
+# 验收（构建检查 + 49 单测 + HTTP 冒烟：永不放行违规闭环、两条替代违规环的
+# 最小切换抑制修复与原有读取回归），退出码报告
 docker compose up --build verify
 # 自定义端口：
 LTL_PORT=8090 LTL_HOST_PORT=9090 docker compose up --build verify

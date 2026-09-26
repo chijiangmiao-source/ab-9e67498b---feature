@@ -2,8 +2,9 @@
 """Compose verify 服务入口：
 
 1. 构建检查：全部源码可编译（字节码语法检查）；
-2. 代码测试：unittest 全量用例（含永不放行违规闭环检测）；
-3. HTTP 冒烟：健康检查、成立结论、违规闭环证据、非法请求 400 且无审计、编号读取。
+2. 代码测试：unittest 全量用例（含永不放行违规闭环检测与最小切换抑制审计）；
+3. HTTP 冒烟：健康检查、成立结论、违规闭环证据、非法请求 400 且无审计、编号读取、
+   两条替代违规环的最小切换抑制审计（含可复算证明）与原有读取回归。
 
 任一步失败即以非零退出码退出。
 """
@@ -79,6 +80,28 @@ COMPLIANT = {
     "formula": "G(!request | F granted)",
 }
 
+# 两条替代违规环：idle→req→idle（t1,q1 迟发环）与 req→hold→req（d1,d2 悬置环）。
+# {t1} 虽同时命中两环但会令 idle 失去全部外出切换（禁止）；
+# 全局最少修复为 {d1,q1} 与 {d2,q1}，升序稳定裁决取 ["d1","q1"]。
+TWO_LOOPS = {
+    "locations": ["idle", "req", "hold", "grant"],
+    "initial": "idle",
+    "switches": [
+        {"id": "t1", "source": "idle", "target": "req"},
+        {"id": "d1", "source": "req", "target": "hold"},
+        {"id": "d2", "source": "hold", "target": "req"},
+        {"id": "e1", "source": "req", "target": "grant"},
+        {"id": "e2", "source": "hold", "target": "grant"},
+        {"id": "q1", "source": "req", "target": "idle"},
+        {"id": "t6", "source": "grant", "target": "idle"},
+    ],
+    "propositions": {
+        "idle": [], "req": ["request"], "hold": ["request"],
+        "grant": ["granted"],
+    },
+    "formula": "G(!request | F granted)",
+}
+
 
 def main():
     # 1. 构建检查
@@ -129,6 +152,7 @@ def main():
           str(body.get("normalization")))
 
     status, body = http("POST", "/checks", STARVATION)
+    starv_id = body.get("id")
     v = body.get("violation") or {}
     steps = v.get("steps", [])
     m = v.get("loop_start_index")
@@ -171,6 +195,67 @@ def main():
 
     status, body = http("GET", "/checks/CHK-000000")
     check("不存在编号 404", status == 404)
+
+    # ---- 最小切换抑制审计：两条替代违规环 ----
+    section("最小切换抑制审计（两条替代违规环）")
+    status, body = http("POST", "/checks", TWO_LOOPS)
+    src = body.get("id")
+    check("两条替代违规环被判不成立",
+          status == 201 and body.get("holds") is False and src,
+          f"status={status}")
+    before = http("GET", f"/checks/{src}")[1] if src else {}
+
+    status, audit = http("POST", f"/checks/{src}/suppressions")
+    sup_id = audit.get("id")
+    check("抑制审计 201 且全局最少数量为 2",
+          status == 201 and audit.get("min_disabled_count") == 2 and sup_id,
+          f"status={status} body={audit}")
+    check("禁用切换升序稳定裁决为 ['d1', 'q1']（{t1} 死端被禁选）",
+          audit.get("disabled_switches") == ["d1", "q1"],
+          f"disabled={audit.get('disabled_switches')}")
+    check("审计含来源复核编号与原公式摘要",
+          audit.get("source_check_id") == src
+          and audit.get("formula_summary", {}).get("formula")
+          == TWO_LOOPS["formula"])
+    check("修复后结论成立",
+          audit.get("post_repair", {}).get("holds") is True)
+
+    status, fetched = http("GET", f"/suppressions/{sup_id}")
+    check("审计按编号读取且内容一致",
+          status == 200 and fetched.get("id") == sup_id
+          and fetched.get("disabled_switches") == ["d1", "q1"],
+          f"status={status}")
+
+    reduced = (fetched.get("proof") or {}).get("reduced_procedure")
+    status, recheck = http("POST", "/checks", reduced) if reduced else (0, {})
+    check("可复算的最终证明：禁用后规程复核成立",
+          status == 201 and recheck.get("holds") is True,
+          f"status={status}")
+
+    # 原有读取回归：来源复核不被改写，结论仍为不成立、规程原样
+    status, after = http("GET", f"/checks/{src}")
+    check("原有读取回归：来源复核不被改写",
+          status == 200 and after == before
+          and after.get("holds") is False
+          and after.get("spec", {}).get("switches") == TWO_LOOPS["switches"],
+          f"status={status}")
+
+    # 失败定位：来源成立 / 编号不存在 / 无可行修复，均不创建审计
+    status, body = http("POST", f"/checks/{ok_id}/suppressions")
+    check("来源结论成立 409 且不创建审计",
+          status == 409 and body.get("error") == "source_already_holds"
+          and "id" not in body,
+          f"status={status} body={body}")
+    status, body = http("POST", "/checks/CHK-999999/suppressions")
+    check("来源编号不存在 404 且不创建审计",
+          status == 404 and "id" not in body)
+    status, body = http("POST", f"/checks/{starv_id}/suppressions")
+    check("无可行修复（保持全部位置可外出）422 且不创建审计",
+          status == 422 and body.get("error") == "no_feasible_suppression"
+          and "id" not in body,
+          f"status={status} body={body}")
+    status, body = http("GET", "/suppressions/SUP-999999")
+    check("不存在审计编号 404", status == 404)
 
     section("汇总")
     if FAILURES:

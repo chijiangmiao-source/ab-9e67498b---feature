@@ -1,6 +1,8 @@
-"""复核审计的持久化存储（JSON 文件，线程安全）。
+"""审计的持久化存储（JSON 文件，线程安全）。
 
-复核成功后保存编号与结论；非法请求在校验阶段即被拒绝，不生成编号、不落审计。
+复核与最小切换抑制审计各用一个存储文件（编号前缀不同），成功才保存；
+非法请求在校验/判定阶段即被拒绝，不生成编号、不落审计。
+服务重启后按编号重新读文件即可读取历史审计。
 """
 
 from __future__ import annotations
@@ -12,9 +14,15 @@ from typing import Any, Dict, List, Optional
 
 
 class AuditStore:
-    def __init__(self, data_dir: str):
+    def __init__(
+        self,
+        data_dir: str,
+        filename: str = "audit.json",
+        prefix: str = "CHK",
+    ):
         self.data_dir = data_dir
-        self.path = os.path.join(data_dir, "audit.json")
+        self.path = os.path.join(data_dir, filename)
+        self.prefix = prefix
         self._lock = threading.Lock()
         os.makedirs(data_dir, exist_ok=True)
         if not os.path.exists(self.path):
@@ -31,11 +39,11 @@ class AuditStore:
             return json.load(fh)
 
     def save(self, record: Dict[str, Any]) -> str:
-        """保存一条复核记录，返回分配的审计编号。"""
+        """保存一条审计记录，返回分配的审计编号。"""
         with self._lock:
             data = self._read()
             data["seq"] += 1
-            audit_id = f"CHK-{data['seq']:06d}"
+            audit_id = f"{self.prefix}-{data['seq']:06d}"
             record = {"id": audit_id, **record}
             data["records"][audit_id] = record
             self._write_locked(data)
